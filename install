@@ -1,0 +1,343 @@
+#!/bin/bash
+
+#
+# Write colored output
+#
+
+red() {
+  echo -e "\033[0;31m$1\033[0m"
+}
+cyan() {
+  echo -e "\033[0;36m$1\033[0m"
+}
+
+# 
+# Abort with an exit message
+# 
+
+abort() {
+  echo "`red abort:` $1"
+  # ring
+  echo -en "\007"
+  exit 1
+}
+
+# 
+# By default /usr/local/bin is placed after /usr/bin in the $PATH
+# This function updates the $PATH with /usr/local/bin placed just before /usr/bin
+# It's a temporary path, only valid in this install session
+# 
+
+path_local_first() {
+  # convert $PATH to an array
+  local tmp=$IFS
+  IFS=:
+  local arr=($PATH)
+  # remove /usr/local/bin from the array
+  unset IFS
+  arr=(${arr[@]%%/usr/local/bin})
+  # replace in the array /usr/bin by /usr/local/bin:/usr/bin
+  arr=(${arr[@]/\/usr\/bin//usr/local/bin:/usr/bin})
+  # join the array with : as $PATH
+  IFS=:
+  PATH="${arr[*]}"
+  export PATH
+  IFS=$tmp
+}
+
+#
+# Check Git presence. Abort script if not installed
+#
+
+check_minimal_git() {
+  echo "check `cyan git`..."
+  # git not detected in the $PATH
+  if [[ -z `type -P git` ]]; then
+    # git also not installed inside /Developer
+    if [[ ! -x /Developer/usr/bin/git ]]; then
+      abort 'git must be installed'
+    fi
+  fi
+}
+
+#
+# Check if homebrew is already installed. If yes, just update it
+# If no, install a minimal version (without all git history) in /usr/local/homebrew
+#
+
+check_homebrew() {
+
+  # inner functions
+  function install() {
+    echo "install `cyan homebrew`..."
+    echo "check `cyan /usr/local` owner..."
+    # prompt to chown /usr/local if I am not the owner
+    if [[ `stat -f %u /usr/local` != `id -u` ]]; then
+      echo "`red warn:` you are not the owner of the directory `cyan /usr/local`"
+      while true; do
+        echo -n "do you want to `cyan 'sudo chown'` it? [Yn]: "
+        read r
+        r=$(echo "$r" | tr '[A-Z]' '[a-z]')
+        case "$r" in
+          y|n) break ;;
+           '') r='y' && break ;;
+        esac
+      done
+      [[ "$r" == 'y' ]] && sudo chown `whoami` /usr/local || abort 'chown required'
+    fi
+
+    # clone homebrew with the available git
+    local tmp
+    [[ `type -P git` ]] && tmp=git || tmp=/Developer/usr/bin/git
+
+    # install minimal homebrew (without all repository history)
+    eval "$tmp clone --depth 1 https://github.com/mxcl/homebrew.git /usr/local/homebrew"
+
+    # temp path, only valid in this install session
+    PATH=/usr/local/homebrew/bin:$PATH
+    export PATH
+
+    echo "check `cyan homebrew` install..."
+    # check if brew is now in the path
+    if [[ -z `type -P brew` ]]; then
+      abort 'the scripted install of homebrew has failed. Please do it manually'
+    fi
+  }
+  function update() {
+    echo "update `cyan homebrew`..."
+    # brew update: fetch the newest version of homebrew and all formulae from gitHub using git
+    brew update
+  }
+
+  echo "check `cyan homebrew`..."
+  local tmp=`type -t brew`
+  # homebrew detected, update it
+  if [[ "$tmp" = 'file' || "$tmp" = 'function' ]]; then
+    update
+  else
+    # brew not in the path and also not on the machine
+    if [[ ! -x /usr/local/homebrew/bin/brew ]]; then
+      install
+    # it's only a path problem
+    else
+      # temp path, only valid in this install session
+      PATH=/usr/local/homebrew/bin:$PATH
+      export PATH
+      update
+    fi
+  fi
+  unset -f install
+  unset -f update
+}
+
+#
+# Check if command line tools are installed. It's required to compile homebrew formulas
+# If no, abort the script
+#
+
+check_command_line_tools() {
+  echo "check `cyan 'command line tools'`..."
+  local path=`type -P brew`
+
+  # homebrew detected
+  if [[ -n "$path" && -x "$path" ]]; then
+    path=`eval "$path --prefix"`/Library/Homebrew
+    # dirty hack to call the command line tools detection done by homebrew
+    local check=`ruby -e "$:.unshift('$path'); require 'global'; puts MacOS::CLT.installed?" 2>/dev/null`
+    # $check is true, everything is ok
+    if [[ -n `echo $check | grep true` ]]; then
+      echo > /dev/null
+    # $check is false, command line tools are not installed
+    elif [[ -n `echo $check | grep false` ]]; then
+      abort 'the command line tools must be installed. Please do it manually https://developer.apple.com/downloads' 
+    # otherwise means the ruby call return an error
+    # the detection done by homebrew must have changed. New method name?
+    else
+      abort 'the command check_command_line_tools return an error'
+    fi
+  # homebrew not detected, probably impossible here
+  else
+    abort 'homebrew not detected'
+  fi
+}
+
+#
+# Check if $1 was installed with homebrew. If yes, just upgrade it
+# If no, install $1 with homebrew
+#
+
+check_formula() {
+  echo "check `cyan "homebrew $1"`..."
+  # $1 not found, install it
+  if [[ -z `brew ls -1 | grep ^$1$` ]]; then
+    echo "install `cyan "$1"` with homebrew..."
+    brew install "$1"
+  else
+    # $1 found, but need an upgrade
+    if [[ `brew outdated | grep ^$1` ]]; then
+      echo "upgrade `cyan "homebrew $1"`..."
+      brew upgrade "$1"
+    fi
+  fi
+}
+
+#
+# Install or update a git repository
+# $1 is the destination directory
+# $2 is the git repository url
+#
+
+check_repository() {
+
+  # inner functions
+  function simplify() {
+    # if the path is in the user directory ($HOME), reduce it using the shortcut '~'
+    [[ $HOME == ${1:0:${#HOME}} ]] && echo ~${1:${#HOME}} || echo $1
+  }
+  function install() {
+    echo "install repository in `cyan "$(simplify $1)"`..."
+    # git clone without history
+    git clone --quiet --depth 1 "$2" "$1"
+    if [[ $? -ne 0 ]]; then
+      abort "git clone error with repository $2"
+    fi
+  }
+  function integrity() {
+    cd "$1"
+    git status &>/dev/null
+    # not a git repo
+    if [[ $? -ne 0 ]]; then
+      abort "the directory `simplify $1` is not a git repository"
+    else
+      # not the same git repository
+      if [[ -z `git remote -v | grep ^origin.*$2.*fetch` ]]; then
+        abort "the directory `simplify $1` is not a clone of $2"
+      fi
+    fi
+  }
+  function revert() {
+    cd "$1"
+    local tmp=$IFS
+    IFS=$'\n'
+    local files=(`git diff --name-status | grep "^M" | sed "s/^M[[:blank:]]//"`)
+    IFS=$tmp
+    # locally modified files found
+    if [[ ${#files[@]} -ne 0 ]]; then
+      # create a timestamped backup directory in the ignored .backup directory
+      local backup="$1/.backup/$(date +%Y-%m-%d--%H-%M-%S)"
+      mkdir -p "$backup"
+
+      # backup locally modified files
+      local name path
+      for f in ${files[@]}; do
+        name=${f##*/}
+        path=${f:0:$((${#f} - ${#name}))}
+        [[ -n $path ]] && mkdir -p "$backup/$path"
+        mv "$1/$f" "$backup/$path"
+        echo "backup `cyan "$(simplify "$1/$f")"` into `cyan "$(simplify "$backup/$path")"`"
+      done
+    fi
+  }
+  function update() {
+    cd "$1"
+    # silently revert git repo, now ready to pull
+    git reset --hard &>/dev/null
+    echo "update `cyan "$(simplify $1)"`..."
+    git pull
+  }
+  function insert() {
+    cd "$1"
+    local src=`ls -1 | egrep '^source($|\.sh$)' | head -n 1`
+    # source file found
+    if [[ -n "$src" ]]; then
+      # the ~/.bash_profile file doesn't exists
+      if [[ ! -f ~/.bash_profile ]]; then
+        echo "create `cyan "~/.bash_profile"`..."
+        touch ~/.bash_profile
+      fi
+      # source command targeting $src not found
+      if [[ -z `egrep "^[^#]*source[[:blank:]]+($1/$src|$(simplify $1/$src))" ~/.bash_profile` ]]; then
+        echo "insert `cyan "source $(simplify $1/$src)"` in `cyan "~/.bash_profile"`..."
+        # last char in ~/.bash_profile is not newline
+        if [[ -z `od -A n -a ~/.bash_profile | grep -v ^$ | tail -n 1 | grep 'nl[[:blank:]]*$'` ]]; then
+          # insert a newline
+          echo >> ~/.bash_profile
+        fi
+        echo -e "[[ -f $(simplify $1/$src) ]] && source $(simplify $1/$src)" >> ~/.bash_profile
+      fi
+    fi
+  }
+  function package() {
+    cd "$1"
+    # package.json file found
+    if [[ -f "$1/package.json" ]]; then
+      echo "update `cyan "npm packages"`..."
+      # check if npm is in the path
+      if [[ -z `type -P npm` ]]; then
+        abort 'npm must be installed'
+      fi
+      npm install
+    fi
+  }
+
+  [[ -z "$1" || -z "$2" ]] && abort "function `cyan check_repository` require 2 defined variables"
+
+  local cwd="$(pwd)"
+  echo "check repository `cyan "$(simplify $1)"`..."
+  # the directory $1 doesn't exists
+  if [[ ! -d "$1" ]]; then
+    install "$1" "$2"
+  # the directory $1 exists
+  else
+    # checks the repository integrity
+    integrity "$1" "$2"
+
+    # revert locally modified files to prevents the merge warnings with 'git pull'
+    revert "$1"
+
+    update "$1"
+  fi
+  
+  # insert source ./source(.sh) to ~/.bash_profile
+  insert "$1"
+
+  # update npm packages
+  package "$1"
+
+  cd "$cwd"
+
+  unset -f simplify
+  unset -f install
+  unset -f integrity
+  unset -f revert
+  unset -f update
+  unset -f insert
+  unset -f package
+}
+
+
+
+path_local_first
+check_minimal_git
+check_homebrew
+check_command_line_tools
+check_formula git
+
+# directory=~/.sub1
+# repository=git@github.com:jeromedecoster/sub1.git
+
+# while [[ $# -ne 0 ]]; do
+#   case $1 in
+#     -d) shift; directory=`echo "$1" | sed 's/\/*$//'` ;;
+#     -r) shift; repository=$1 ;;
+#   esac
+#   shift
+# done
+
+# check_repository $directory $repository
+
+# check_repository $directory/modules/mai1 git@github.com:jeromedecoster/mai1.git
+
+check_repository ~/.sub1 git@github.com:jeromedecoster/sub1.git
+
+check_repository ~/.sub1/modules/mai1 git@github.com:jeromedecoster/mai1.git
